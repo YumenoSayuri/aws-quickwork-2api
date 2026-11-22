@@ -4,12 +4,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// maxAttachmentBytes caps one uploaded file.
-const maxAttachmentBytes = 25 * 1024 * 1024
+// defaultMaxAttachmentBytes matches the upstream per-file ceiling. It is only a
+// safety valve for this process: the proxy streams the bytes through untouched.
+const defaultMaxAttachmentBytes = 95 * 1024 * 1024
+
+// maxAttachmentBytes reports the per-file cap, overridable via env.
+func maxAttachmentBytes() int {
+	if v := strings.TrimSpace(os.Getenv("QUICKWORK_MAX_ATTACHMENT_MB")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n * 1024 * 1024
+		}
+	}
+	return defaultMaxAttachmentBytes
+}
 
 // handleFiles implements a small OpenAI-compatible file upload:
 //
@@ -27,7 +40,7 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid or missing API key")
 		return
 	}
-	if err := r.ParseMultipartForm(maxAttachmentBytes); err != nil {
+	if err := r.ParseMultipartForm(int64(maxAttachmentBytes())); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
 			"expected multipart/form-data with a file field")
 		return
@@ -39,14 +52,14 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	body, err := io.ReadAll(io.LimitReader(file, maxAttachmentBytes+1))
+	body, err := io.ReadAll(io.LimitReader(file, int64(maxAttachmentBytes())+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "cannot read uploaded file")
 		return
 	}
-	if len(body) > maxAttachmentBytes {
+	if len(body) > maxAttachmentBytes() {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-			fmt.Sprintf("file exceeds %d bytes", maxAttachmentBytes))
+			fmt.Sprintf("file exceeds %d bytes", maxAttachmentBytes()))
 		return
 	}
 
@@ -146,7 +159,7 @@ func attachmentsForTurn(r *http.Request, msgs []Message) []RawAttachment {
 					continue
 				}
 				mt, data, ok := decodeDataURI(u)
-				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes {
+				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes() {
 					continue
 				}
 				imgIdx++
@@ -170,7 +183,7 @@ func attachmentsForTurn(r *http.Request, msgs []Message) []RawAttachment {
 				}
 				name, _ := f["filename"].(string)
 				mt, data, ok := decodeDataURI(rawData)
-				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes {
+				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes() {
 					continue
 				}
 				out = append(out, RawAttachment{

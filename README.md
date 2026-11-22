@@ -323,7 +323,7 @@ for chunk in client.chat.completions.create(
 
 ### 接口
 
-- `POST /v1/files`（multipart）暂存文件，返回 `file-<id>`；真正上传发生在对话轮次内，以保证账号一致。单文件上限 25 MB，请求体上限 32 MB。
+- `POST /v1/files`（multipart）暂存文件，返回 `file-<id>`；真正上传发生在对话轮次内，以保证账号一致。单文件上限默认 **95 MB**（`QUICKWORK_MAX_ATTACHMENT_MB` 可调，暂存池 `QUICKWORK_STAGING_MB`，默认 512 MB），请求体上限 32 MB。
 - 对话请求里用 `X-Quickwork-Attachments: file-<id>[,file-<id2>]` 引用，或直接在 `messages` 里放 `image_url` 的 data URL / `file` part。
 
 ## 多账号轮询## 多账号轮询
@@ -442,6 +442,15 @@ Thanks to the [LINUX DO](https://linux.do) community for its support.
 ## 版本历史
 
 > 本仓库从上游 v0.4.1 分叉，以下只记录本 fork 相对上游的变更，倒序排列；时间取提交时的真实时间（UTC+08:00）。
+
+### v0.8.1 — 2026-11-22 18:47:06
+
+放开附件体积并明确“原图直传”。
+
+- 单文件上限从写死的 25 MB 改为默认 95 MB（对齐上游），可用 `QUICKWORK_MAX_ATTACHMENT_MB` 调整；暂存池上限 512 MB，可用 `QUICKWORK_STAGING_MB` 调整
+- 上传字节与本地文件完全一致，不做任何重编码／缩放（代码中无 image 解码逻辑）；日志会打印 `uploaded as-is: N bytes original` 与工作区落盘路径，便于核对
+- 说明：模型侧视觉编码器在推理前会把图片缩到约 2000 px 宽，这是上游预处理，不经过本代理；原分辨率文件留在会话工作区，agent 可按需读取
+- 澄清指标：日志里的 `frame=N bytes` 是 WebSocket 帧内元数据大小，与图片体积无关
 
 ### v0.8.0 — 2026-11-22 18:37:47
 

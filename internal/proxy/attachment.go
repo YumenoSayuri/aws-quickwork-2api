@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -328,6 +329,7 @@ func (u *Upstream) prepareAttachment(ctx context.Context, sess *Session, threadI
 	}
 	descriptor["path"] = path
 	delete(descriptor, "data")
+	log.Printf("attachment %q uploaded as-is: %d bytes original, workspace=%s", name, len(att.Data), path)
 	return descriptor, nil
 }
 

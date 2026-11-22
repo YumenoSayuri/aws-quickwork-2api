@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +35,18 @@ var (
 	attachmentStoreMu sync.Mutex
 )
 
-// storedAttachmentBudget bounds how many bytes parked files may hold.
-const storedAttachmentBudget = 96 * 1024 * 1024
+// defaultStoredBudget bounds how many bytes parked files may hold; large files
+// live on the process heap until a turn claims them.
+const defaultStoredBudget = 512 * 1024 * 1024
+
+func storedAttachmentBudget() int {
+	if v := strings.TrimSpace(os.Getenv("QUICKWORK_STAGING_MB")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n * 1024 * 1024
+		}
+	}
+	return defaultStoredBudget
+}
 
 func storeAttachment(st StoredAttachment) string {
 	id := newUUID()
@@ -63,7 +75,7 @@ func evictStoredAttachments() {
 		total += len(st.Data)
 		return true
 	})
-	if total <= storedAttachmentBudget {
+	if total <= storedAttachmentBudget() {
 		return
 	}
 	// Oldest first.
@@ -73,7 +85,7 @@ func evictStoredAttachments() {
 		}
 	}
 	for _, e := range all {
-		if total <= storedAttachmentBudget {
+		if total <= storedAttachmentBudget() {
 			return
 		}
 		attachmentStore.Delete(e.id)

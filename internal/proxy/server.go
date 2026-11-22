@@ -118,9 +118,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		parallelTools = *req.ParallelToolCalls
 	}
 	budget := payloadBudget()
+	attachIDs := attachmentIDsFromRequest(r, req.Messages)
+	attachShape := strings.TrimSpace(r.Header.Get("X-Quickwork-Attachment-Shape"))
+	attachments := buildAttachmentRefs(attachIDs, attachShape)
 	// The upstream rejects any single user_message frame over 64 KB. Keep the
-	// assembled request inside the budget: first by compacting the tool
-	// schemas, then by dropping the oldest conversation turns.
+	// assembled request inside the budget: compact the tool schemas, then drop
+	// inline attachment payloads, then drop the oldest conversation turns.
 	bridgePrompt := buildToolBridgePromptSized(req.Tools, req.Functions, choiceMode, choiceName, parallelTools, false)
 	sysText := joinSystem(systemPromptText, bridgePrompt)
 	dropped := 0
@@ -130,11 +133,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sysText = joinSystem(systemPromptText, bridgePrompt)
 		total, _, _ = payloadBytes(prompt, sysText)
 	}
-	if total > budget {
-		prompt, dropped = formatPromptBudget(req.Messages, budget-len(sysText)-envelopeSlack)
+	// Inline attachments ride inside the frame. If they push it over budget,
+	// shed the heaviest inline payloads first (their id reference remains).
+	if !attachBypassBudget() && total+attachmentBytes(attachments) > budget {
+		attachments = trimInlineAttachments(attachments, budget-total-envelopeSlack)
+	}
+	attachSize := attachmentBytes(attachments)
+	if total+attachSize > budget {
+		prompt, dropped = formatPromptBudget(req.Messages, budget-len(sysText)-attachSize-envelopeSlack)
 		total, _, _ = payloadBytes(prompt, sysText)
 	}
-	if total > budget {
+	total += attachSize
+	if total > budget && !attachBypassBudget() {
 		writeOpenAIError(w, http.StatusBadRequest, "request_too_large",
 			payloadTooLargeError(total, budget, prompt, sysText, dropped).Error())
 		return
@@ -158,13 +168,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
 	in := ChatInput{
-		Prompt:          prompt,
-		Model:           model,
-		ThreadID:        threadID,
-		Title:           titleFor(lastUserText(req.Messages)),
-		SystemPrompt:    systemPromptText,
-		Attachments:     attachmentIDsFromRequest(r, req.Messages),
-		AttachmentShape: strings.TrimSpace(r.Header.Get("X-Quickwork-Attachment-Shape")),
+		Prompt:       prompt,
+		Model:        model,
+		ThreadID:     threadID,
+		Title:        titleFor(lastUserText(req.Messages)),
+		SystemPrompt: systemPromptText,
+		Attachments:  attachments,
 	}
 
 	if !req.Stream {

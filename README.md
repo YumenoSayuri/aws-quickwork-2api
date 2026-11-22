@@ -307,9 +307,46 @@ curl -X POST http://127.0.0.1:8080/v1/files \
 
 单文件上限 20 MB。
 
-> **状态说明**：上传本身已实测通过；但把 `attachmentId` 送进对话帧的字段格式尚未确认（`payload.attachments` 等十余种组合均被上游静默忽略），所以目前上传的文件不会自动进入模型上下文。若抓到了官方客户端的真实帧格式，可在 `internal/proxy/attachment.go` 的 `attachPayload` 里补上。
+> **状态说明**：上传与内联投递均已实测通过，但**体积受上游 64 KB 帧限制约束**（见下）。
 
-## 多账号轮询
+### 对话帧里的附件格式
+
+附件挂在 `user_message` 帧的 `payload.attachments` 上，元素形状来自官方客户端序列化器：
+
+```json
+{
+  "type": "file" | "image",
+  "name": "report.md",
+  "size": 1234,
+  "mimeType": "text/markdown",
+  "path": "attached_files/report.md",
+  "attachmentId": "uuid",
+  "contentSha256": "hex",
+  "data": "data:text/plain;base64,..."
+}
+```
+
+- `data` 存在时，文件内容随帧内联传输，后端直接解析，**无需先绑定会话**——这是本代理采用的路径。
+- `data` 缺失时，后端按 `path` 去会话工作区（`workspace/attached_files/`）取文件。这条 out-of-band 路径要求先完成"上传 → DLP 扫描 → 绑定到会话"的投递步骤，客户端走的是 agent runtime 接口，本代理尚未实现，因此仅发 id 引用会被静默忽略（模型回 `NOFILE`）。
+
+### 体积上限（实测）
+
+| 附件原始大小 | 结果 |
+| --- | --- |
+| 2 KB（PNG 文字图） | 通过，模型准确读出图中文字 |
+| 32 KB / 37 KB（真实照片，JPEG） | 通过，准确读出图内中文标题、英文副标与版权行 |
+| 47 KB | 失败，上游丢弃附件（模型回 `NOIMAGE`） |
+| 2.6 MB | 失败，同上 |
+
+原因是内联内容以 base64（约 1.33 倍膨胀）计入同一个 64 KB 帧预算，与 `text`／`system_prompt` 共享额度。因此：
+
+- 默认内联上限 40 KB（`QUICKPROXY_INLINE_MAX` 的等价开关为 `QUICKWORK_INLINE_MAX`，单位字节）。
+- 超出上限的附件会保留 id/name 引用但丢弃 `data`，模型只能看到"有这么一个文件"。
+- 更大的文件要真正送达，需要补上 out-of-band 投递链路；在那之前，大上下文应走上面的历史裁剪与工具协议精简。
+
+图片建议控制在 1100×460 左右（JPEG 质量 35 上下约 32 KB），可直接获得可用的视觉能力。
+
+## 多账号轮询## 多账号轮询
 
 账号存在 SQLite 的 `accounts` 表，按 ID 轮询：
 
@@ -425,6 +462,17 @@ Thanks to the [LINUX DO](https://linux.do) community for its support.
 ## 版本历史
 
 > 本仓库从上游 v0.4.1 分叉，以下只记录本 fork 相对上游的变更，倒序排列；时间取提交时的真实时间（UTC+08:00）。
+
+### v0.7.0 — 2026-11-22 18:13:45
+
+打通图片与文件附件，确认上游帧限制同样作用于附件。
+
+- `POST /v1/files` 上传后可被对话直接引用：附件以 `payload.attachments[]` 投递，元素形状与官方客户端序列化器一致（`type` / `name` / `size` / `mimeType` / `path` / `attachmentId` / `contentSha256` / `data`）
+- 采用内联投递（`data` 为 data URL）：文件随帧传输，无需先绑定会话；实测 2 KB 文字图与 32/37 KB 真实照片均能被模型正确读解（读出图内随机码、中文标题、英文副标与版权行）
+- 内联上限默认 40 KB，可用 `QUICKWORK_INLINE_MAX` 调整；超出时保留引用、丢弃 `data`
+- 修正：默认附件形状此前指向需要 out-of-band 投递的引用形式，导致图片一律被上游忽略；现默认内联
+- 附带实验开关 `QUICKWORK_ATTACH_BYPASS_BUDGET`，用于测量上游真实帧上限
+- 已知限制：47 KB 以上附件仍被上游丢弃（内联内容与 `text`／`system_prompt` 共享同一个 64 KB 帧预算）；更大的文件需要 out-of-band 投递链路，尚未实现
 
 ### v0.6.0 — 2026-11-22 17:30:08
 

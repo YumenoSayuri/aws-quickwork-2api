@@ -36,9 +36,7 @@ type ChatInput struct {
 	ThreadID     string
 	Title        string
 	SystemPrompt string
-	Attachments  []string
-	// AttachmentShape overrides how attachments are encoded in the frame.
-	AttachmentShape string
+	Attachments  []map[string]any
 }
 
 // ToolCallState is a tool invocation reported by the QuickWork agent.
@@ -218,15 +216,12 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		payload["system_prompt"] = in.SystemPrompt
 	}
 	if len(in.Attachments) > 0 {
-		attachPayload(payload, in.Attachments, in.AttachmentShape)
+		attachPayload(payload, in.Attachments)
 	}
 	if u.cfg.ThinkingEffort != "" && u.cfg.ThinkingEffort != "off" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
 	}
 	frame := map[string]any{"type": "user_message", "payload": payload}
-	if len(in.Attachments) > 0 && attachmentShape(in.AttachmentShape) == "frame" {
-		frame["attachments"] = attachmentObjects(in.Attachments)
-	}
 	if err := send(frame); err != nil {
 		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
 	}

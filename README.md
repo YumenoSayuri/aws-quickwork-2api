@@ -24,6 +24,8 @@
 - 上游原生 `tool_start` / `tool_arguments` / `tool_result` 在名称匹配时也会转成 OpenAI `tool_calls`
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
 - `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令；不拼进 user 文本
+- `POST /v1/files` 把文件上传到上游数据平面，返回 `file-<attachmentId>`（见「附件上传」一节）
+- **自动适配上游 64 KB 帧限制**：超出时先精简工具协议 schema，再从最老轮次裁剪历史，仍未达标则返回带字节明细的 400，而不是让上游丢回一句看不懂的错误
 
 ## 环境要求
 
@@ -276,6 +278,37 @@ for chunk in client.chat.completions.create(
 | `DELETE` | `/api/accounts/{id}` | 删除账号 |
 | `GET` \| `POST` | `/api/config` | 读取 / 写回运行参数 |
 
+## 附件上传
+
+上游数据平面是 Amazon Coral（Smithy RPC）风格的服务，操作名直接走路径。附件上传的调用方式与常见的 JSON API 不同——**参数在 query 上，请求体是文件原始字节**：
+
+```
+POST {tenantUrl}/integration/quick-work/upload-attachment
+     ?name=report.md&contentLength=1234&contentType=text/markdown
+Authorization: Bearer <access_token>
+Content-Type: text/markdown
+
+<文件原始字节>
+
+-> 200 {"attachmentId":"f1a4e45d-21d9-4212-b355-9ea17038d718"}
+```
+
+`tenantUrl` 就是账号 OAuth discovery 返回的 `tenantUrl`（形如 `https://qbs-cell...dp.appintegrations.us-east-1.prod.plato.ai.aws.dev`）。
+
+代理把这一步包成 OpenAI 风格的上传接口：
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/files \
+  -H "Authorization: Bearer sk-local" \
+  -F "file=@report.md;type=text/markdown" \
+  -F "purpose=assistants"
+# -> {"id":"file-f1a4e45d-...","object":"file","bytes":1234,"filename":"report.md","created_at":...}
+```
+
+单文件上限 20 MB。
+
+> **状态说明**：上传本身已实测通过；但把 `attachmentId` 送进对话帧的字段格式尚未确认（`payload.attachments` 等十余种组合均被上游静默忽略），所以目前上传的文件不会自动进入模型上下文。若抓到了官方客户端的真实帧格式，可在 `internal/proxy/attachment.go` 的 `attachPayload` 里补上。
+
 ## 多账号轮询
 
 账号存在 SQLite 的 `accounts` 表，按 ID 轮询：
@@ -344,6 +377,8 @@ sequenceDiagram
 - 工具执行在客户端；代理只负责把模型输出转成 `tool_calls`。桥接使用文本协议，模型偶尔可能不遵守；带工具的流式响应会缓冲到本轮结束。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
+- 上游对单个 `user_message` 帧有 **64 KB 上限**（超出返回 `FrameTooLarge`）。代理会在发送前把请求压到预算内：先精简工具协议（去掉缩进与 schema 注解），再从最老轮次裁剪历史并追加一条省略提示；仍不够则返回 400 `request_too_large` 并说明是 `text` 还是 `system_prompt` 超限。预算默认 62000 字节，可用环境变量 `QUICKPROXY_MAX_PAYLOAD` 调整。
+- `POST /v1/files` 的上传链路已验证可用；**但把 attachmentId 关联进对话帧的字段格式尚未确认**，因此目前上传的文件不会自动进入模型上下文，长内容仍靠上面的预算裁剪兜底。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
 - 上游 access token 通常约 1 小时到期，反代会按 `refresh_before` 自动刷新；也可手动执行 `quickproxy refresh`。

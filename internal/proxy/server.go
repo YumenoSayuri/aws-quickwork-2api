@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	mux.HandleFunc("/v1/files", s.handleFiles)
+	mux.HandleFunc("/v1/files/", s.handleFiles)
 	return s.withCORS(mux)
 }
 
@@ -114,7 +117,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.ParallelToolCalls != nil {
 		parallelTools = *req.ParallelToolCalls
 	}
-	bridgePrompt := buildToolBridgePrompt(req.Tools, req.Functions, choiceMode, choiceName, parallelTools)
+	budget := payloadBudget()
+	// The upstream rejects any single user_message frame over 64 KB. Keep the
+	// assembled request inside the budget: first by compacting the tool
+	// schemas, then by dropping the oldest conversation turns.
+	bridgePrompt := buildToolBridgePromptSized(req.Tools, req.Functions, choiceMode, choiceName, parallelTools, false)
+	sysText := joinSystem(systemPromptText, bridgePrompt)
+	dropped := 0
+	total, _, _ := payloadBytes(prompt, sysText)
+	if total > budget && bridgePrompt != "" {
+		bridgePrompt = buildToolBridgePromptSized(req.Tools, req.Functions, choiceMode, choiceName, parallelTools, true)
+		sysText = joinSystem(systemPromptText, bridgePrompt)
+		total, _, _ = payloadBytes(prompt, sysText)
+	}
+	if total > budget {
+		prompt, dropped = formatPromptBudget(req.Messages, budget-len(sysText)-envelopeSlack)
+		total, _, _ = payloadBytes(prompt, sysText)
+	}
+	if total > budget {
+		writeOpenAIError(w, http.StatusBadRequest, "request_too_large",
+			payloadTooLargeError(total, budget, prompt, sysText, dropped).Error())
+		return
+	}
+	if dropped > 0 {
+		prompt += "\n\n[note] " + strconv.Itoa(dropped) + " earlier message(s) were omitted to fit the upstream frame limit."
+	}
 	bridgeActive := bridgePrompt != ""
 	if bridgeActive {
 		systemPromptText += "\n\n" + bridgePrompt
@@ -131,11 +158,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
 	in := ChatInput{
-		Prompt:       prompt,
-		Model:        model,
-		ThreadID:     threadID,
-		Title:        titleFor(lastUserText(req.Messages)),
-		SystemPrompt: systemPromptText,
+		Prompt:          prompt,
+		Model:           model,
+		ThreadID:        threadID,
+		Title:           titleFor(lastUserText(req.Messages)),
+		SystemPrompt:    systemPromptText,
+		Attachments:     attachmentIDsFromRequest(r, req.Messages),
+		AttachmentShape: strings.TrimSpace(r.Header.Get("X-Quickwork-Attachment-Shape")),
 	}
 
 	if !req.Stream {

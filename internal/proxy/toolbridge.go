@@ -51,6 +51,13 @@ func collectToolDefinitions(tools []Tool, functions []ToolFunction) []toolDefini
 // tools that only the caller can execute. QuickWork does not accept arbitrary
 // client tool schemas, so the proxy has to carry them in the system prompt.
 func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name string, parallel bool) string {
+	return buildToolBridgePromptSized(tools, functions, mode, name, parallel, false)
+}
+
+// buildToolBridgePromptSized builds the bridge prompt. When lean is true the
+// tool schemas are compacted (no indentation, descriptions and schema
+// annotations dropped) so the frame stays inside the upstream 64 KB limit.
+func buildToolBridgePromptSized(tools []Tool, functions []ToolFunction, mode, name string, parallel, lean bool) string {
 	if mode == "none" {
 		return ""
 	}
@@ -58,7 +65,13 @@ func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name st
 	if len(defs) == 0 {
 		return ""
 	}
-	body, err := json.MarshalIndent(defs, "", "  ")
+	var body []byte
+	var err error
+	if lean {
+		body, err = json.Marshal(leanToolDefinitions(defs))
+	} else {
+		body, err = json.MarshalIndent(defs, "", "  ")
+	}
 	if err != nil {
 		return ""
 	}

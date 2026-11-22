@@ -14,6 +14,7 @@ type Session struct {
 	JWT              string
 	WSHost           string
 	WSPath           string
+	TenantURL        string
 	Provider         string
 	ActorARN         string
 	Surface          string
@@ -38,6 +39,7 @@ func SessionFromAccount(a *store.Account, cfg *config.Config) *Session {
 		JWT:              a.JWT(),
 		WSHost:           a.WSHost,
 		WSPath:           a.WSPath,
+		TenantURL:        a.TenantURL,
 		Provider:         a.Provider,
 		ActorARN:         a.ActorARN,
 		Surface:          surface,

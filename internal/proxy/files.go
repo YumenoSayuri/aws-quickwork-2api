@@ -9,15 +9,15 @@ import (
 )
 
 // maxAttachmentBytes caps one uploaded file.
-const maxAttachmentBytes = 20 * 1024 * 1024
+const maxAttachmentBytes = 25 * 1024 * 1024
 
 // handleFiles implements a small OpenAI-compatible file upload:
 //
-//	POST /v1/files      (multipart/form-data: file=<bytes>, purpose=optional)
-//	-> {"id":"file-<attachmentId>","object":"file","bytes":N,"filename":"..."}
+//	POST /v1/files   (multipart/form-data: file=<bytes>)
+//	-> {"id":"file-<uuid>","object":"file","bytes":N,"filename":"..."}
 //
-// The returned id can be passed in a chat request as an image_url part
-// ("file://<id>") or through the X-Quickwork-Attachments header.
+// The bytes are parked here, not uploaded yet: the real upload happens inside
+// the chat turn so the attachment and the conversation share one account.
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
@@ -28,7 +28,8 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseMultipartForm(maxAttachmentBytes); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "expected multipart/form-data with a file field")
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+			"expected multipart/form-data with a file field")
 		return
 	}
 	file, header, err := r.FormFile("file")
@@ -54,23 +55,13 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(contentType) == "" || contentType == "application/octet-stream" {
 		contentType = contentTypeByName(name)
 	}
-
-	ctx := r.Context()
-	acct, err := s.accounts.Next(ctx)
-	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no_accounts", err.Error())
-		return
-	}
-	sess := SessionFromAccount(acct, s.cfg)
-	if err := sess.validate(); err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
-		return
-	}
-	id, err := s.upstream.UploadAttachment(ctx, sess, name, contentType, body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "upload_failed", err.Error())
-		return
-	}
+	id := storeAttachment(StoredAttachment{
+		Name:      name,
+		MimeType:  contentType,
+		Kind:      attachmentKind(contentType),
+		Data:      body,
+		CreatedAt: time.Now(),
+	})
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":         "file-" + id,
@@ -110,24 +101,33 @@ func contentTypeByName(name string) string {
 	return "application/octet-stream"
 }
 
-// attachmentIDsFromRequest collects attachment ids from the request headers and
-// from any "file://" (or bare "file-") image parts in the messages.
-func attachmentIDsFromRequest(r *http.Request, msgs []Message) []string {
+// attachmentsForTurn collects everything the turn should carry: files parked by
+// /v1/files plus image parts embedded directly in the messages.
+func attachmentsForTurn(r *http.Request, msgs []Message) []RawAttachment {
+	var out []RawAttachment
 	seen := map[string]bool{}
-	out := make([]string, 0, 4)
-	add := func(raw string) {
+
+	for _, raw := range strings.Split(r.Header.Get("X-Quickwork-Attachments"), ",") {
 		id := strings.TrimSpace(raw)
 		id = strings.TrimPrefix(id, "file://")
 		id = strings.TrimPrefix(id, "file-")
 		if id == "" || seen[id] {
-			return
+			continue
+		}
+		st, ok := claimAttachment(id)
+		if !ok {
+			continue
 		}
 		seen[id] = true
-		out = append(out, id)
+		out = append(out, RawAttachment{
+			Kind:     st.Kind,
+			Name:     st.Name,
+			MimeType: st.MimeType,
+			Data:     st.Data,
+		})
 	}
-	for _, raw := range strings.Split(r.Header.Get("X-Quickwork-Attachments"), ",") {
-		add(raw)
-	}
+
+	imgIdx := 0
 	for _, m := range msgs {
 		parts, ok := m.Content.([]any)
 		if !ok {
@@ -139,18 +139,46 @@ func attachmentIDsFromRequest(r *http.Request, msgs []Message) []string {
 				continue
 			}
 			typ, _ := p["type"].(string)
-			if typ == "file" {
-				if f, ok := p["file"].(map[string]any); ok {
-					if v, ok := f["file_id"].(string); ok {
-						add(v)
-					}
-				}
-			}
-			if typ == "image_url" {
+			switch typ {
+			case "image_url", "input_image":
 				u := imagePartURL(p)
-				if strings.HasPrefix(u, "file://") || strings.HasPrefix(u, "file-") {
-					add(u)
+				if u == "" {
+					continue
 				}
+				mt, data, ok := decodeDataURI(u)
+				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes {
+					continue
+				}
+				imgIdx++
+				if !strings.HasPrefix(strings.ToLower(mt), "image/") {
+					mt = http.DetectContentType(data)
+				}
+				out = append(out, RawAttachment{
+					Kind:     "image",
+					Name:     defaultAttachmentName("image", imgIdx, mt),
+					MimeType: mt,
+					Data:     data,
+				})
+			case "file":
+				f, ok := p["file"].(map[string]any)
+				if !ok {
+					continue
+				}
+				rawData, _ := f["file_data"].(string)
+				if rawData == "" {
+					continue
+				}
+				name, _ := f["filename"].(string)
+				mt, data, ok := decodeDataURI(rawData)
+				if !ok || len(data) == 0 || len(data) > maxAttachmentBytes {
+					continue
+				}
+				out = append(out, RawAttachment{
+					Kind:     attachmentKind(mt),
+					Name:     name,
+					MimeType: mt,
+					Data:     data,
+				})
 			}
 		}
 	}

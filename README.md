@@ -278,73 +278,53 @@ for chunk in client.chat.completions.create(
 | `DELETE` | `/api/accounts/{id}` | 删除账号 |
 | `GET` \| `POST` | `/api/config` | 读取 / 写回运行参数 |
 
-## 附件上传
+## 附件与超长上下文
 
-上游数据平面是 Amazon Coral（Smithy RPC）风格的服务，操作名直接走路径。附件上传的调用方式与常见的 JSON API 不同——**参数在 query 上，请求体是文件原始字节**：
+图片和文件走官方同一套**外带（out-of-band）**链路：文件字节留在服务端工作区，WebSocket 帧里只带几百字节元数据，因此**不受 64 KB 单帧限制**。
+
+### 四步协议
 
 ```
-POST {tenantUrl}/integration/quick-work/upload-attachment
-     ?name=report.md&contentLength=1234&contentType=text/markdown
-Authorization: Bearer <access_token>
-Content-Type: text/markdown
+① 上传   POST {tenantUrl}/integration/quick-work/upload-attachment
+          ?name=&contentType=&contentLength=
+          body = 原始字节（Content-Type: application/octet-stream）
+       -> {"attachmentId":"..."}
 
-<文件原始字节>
+② DLP    GET  {tenantUrl}/integration/quick-work/attachment-dlp-status?attachmentId=
+       -> {"dlpJobStatus":"COMPLETED","policyAction":"ALLOW"}   # 404/405 视为未开启
 
--> 200 {"attachmentId":"f1a4e45d-21d9-4212-b355-9ea17038d718"}
+③ 投递   POST {tenantUrl}/integration/quick-work/qbs-event
+          {"eventType":"invokeAgent","eventBody":{"invokeAgent":{
+             "path":"files/upload/{threadID}","queryParams":{"_method":"POST"},
+             "body":{"attachmentId":"..."}}}}
+       -> eventResponse.invokeAgentResponse 是 JSON 字符串，其 body 又是 JSON 字符串，
+          内层才是 {"path":"/data/s3files/.../attached_files/name.jpg"}
+
+④ 引用   user_message.payload.attachments[] =
+          {type,name,size,mimeType,path,attachmentId,contentSha256}
+          有 path 时**绝不能**再带 data
 ```
 
-`tenantUrl` 就是账号 OAuth discovery 返回的 `tenantUrl`（形如 `https://qbs-cell...dp.appintegrations.us-east-1.prod.plato.ai.aws.dev`）。
+三步 HTTP 都在建 WebSocket 之前就能用同一个 `threadID` 完成，因此上传与对话必然落在同一账号、同一会话上——否则投递会返回 `Attachment not found`。
 
-代理把这一步包成 OpenAI 风格的上传接口：
+### 超长上下文自动转存（spill-to-file）
 
-```bash
-curl -X POST http://127.0.0.1:8080/v1/files \
-  -H "Authorization: Bearer sk-local" \
-  -F "file=@report.md;type=text/markdown" \
-  -F "purpose=assistants"
-# -> {"id":"file-f1a4e45d-...","object":"file","bytes":1234,"filename":"report.md","created_at":...}
-```
+单帧上限约 62 KB。组装完 `user_message` 后若超过 54 KB 安全线，且正文或 system prompt 超过 12 KB，就把超长文本转成 `conversation_context.txt` / `system_instructions.txt` 走同一套外带链路，帧里只留提示 + 末尾 3500 字节。
 
-单文件上限 20 MB。
+### 实测
 
-> **状态说明**：上传与内联投递均已实测通过，但**体积受上游 64 KB 帧限制约束**（见下）。
+| 场景 | 帧大小 | 结果 |
+| --- | --- | --- |
+| 2.6 MB 原图（JPEG 4096×1716） | 1818 B | 200，准确读出图中中文标题、英文副标与版权行 |
+| 100 KB 文本，校验码藏在中段 | 5357 B | 200，精准返回 `PROBE-CODE-94821` |
+| 2 KB 文字图 | — | 200，读出图内文字 |
 
-### 对话帧里的附件格式
+上传按内容 sha256 在账号维度去重：同一张图在多轮里重复出现时只上传一次，每轮只重新绑定到当前会话（服务端内部复制，不是重新传输）。
 
-附件挂在 `user_message` 帧的 `payload.attachments` 上，元素形状来自官方客户端序列化器：
+### 接口
 
-```json
-{
-  "type": "file" | "image",
-  "name": "report.md",
-  "size": 1234,
-  "mimeType": "text/markdown",
-  "path": "attached_files/report.md",
-  "attachmentId": "uuid",
-  "contentSha256": "hex",
-  "data": "data:text/plain;base64,..."
-}
-```
-
-- `data` 存在时，文件内容随帧内联传输，后端直接解析，**无需先绑定会话**——这是本代理采用的路径。
-- `data` 缺失时，后端按 `path` 去会话工作区（`workspace/attached_files/`）取文件。这条 out-of-band 路径要求先完成"上传 → DLP 扫描 → 绑定到会话"的投递步骤，客户端走的是 agent runtime 接口，本代理尚未实现，因此仅发 id 引用会被静默忽略（模型回 `NOFILE`）。
-
-### 体积上限（实测）
-
-| 附件原始大小 | 结果 |
-| --- | --- |
-| 2 KB（PNG 文字图） | 通过，模型准确读出图中文字 |
-| 32 KB / 37 KB（真实照片，JPEG） | 通过，准确读出图内中文标题、英文副标与版权行 |
-| 47 KB | 失败，上游丢弃附件（模型回 `NOIMAGE`） |
-| 2.6 MB | 失败，同上 |
-
-原因是内联内容以 base64（约 1.33 倍膨胀）计入同一个 64 KB 帧预算，与 `text`／`system_prompt` 共享额度。因此：
-
-- 默认内联上限 40 KB（`QUICKPROXY_INLINE_MAX` 的等价开关为 `QUICKWORK_INLINE_MAX`，单位字节）。
-- 超出上限的附件会保留 id/name 引用但丢弃 `data`，模型只能看到"有这么一个文件"。
-- 更大的文件要真正送达，需要补上 out-of-band 投递链路；在那之前，大上下文应走上面的历史裁剪与工具协议精简。
-
-图片建议控制在 1100×460 左右（JPEG 质量 35 上下约 32 KB），可直接获得可用的视觉能力。
+- `POST /v1/files`（multipart）暂存文件，返回 `file-<id>`；真正上传发生在对话轮次内，以保证账号一致。单文件上限 25 MB，请求体上限 32 MB。
+- 对话请求里用 `X-Quickwork-Attachments: file-<id>[,file-<id2>]` 引用，或直接在 `messages` 里放 `image_url` 的 data URL / `file` part。
 
 ## 多账号轮询## 多账号轮询
 
@@ -462,6 +442,18 @@ Thanks to the [LINUX DO](https://linux.do) community for its support.
 ## 版本历史
 
 > 本仓库从上游 v0.4.1 分叉，以下只记录本 fork 相对上游的变更，倒序排列；时间取提交时的真实时间（UTC+08:00）。
+
+### v0.8.0 — 2026-11-22 18:37:47
+
+附件改为官方外带链路，图片与超长上下文不再受 64 KB 单帧限制。
+
+- 实现完整四步协议：`upload-attachment` → `attachment-dlp-status` 轮询 → `qbs-event` 的 `invokeAgent` 信封投递 → 帧内只引用 `path`
+- 投递响应是三层嵌套 JSON（`invokeAgentResponse` 与内层 `body` 各为一层字符串），已按层解包
+- 上传与投递改在同一轮、同一账号内完成，修复多账号下投递返回 `Attachment not found`
+- `POST /v1/files` 改为暂存字节、轮次内真实上传；单文件上限 25 MB，请求体上限 32 MB
+- 新增 spill-to-file：帧超 54 KB 且正文/system prompt 超 12 KB 时自动转存为 `conversation_context.txt` / `system_instructions.txt` 并改为引用
+- 上传按内容 sha256 在账号维度去重，多轮重复图片只传一次，每轮仅重新绑定会话
+- 实测：2.6 MB 原图（帧 1818 B）、100 KB 文本（帧 5357 B）均 200 且内容识别准确
 
 ### v0.7.0 — 2026-11-22 18:13:45
 

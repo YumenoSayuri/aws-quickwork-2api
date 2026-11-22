@@ -91,7 +91,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ChatRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20))
 	if err := dec.Decode(&req); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
@@ -118,9 +118,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		parallelTools = *req.ParallelToolCalls
 	}
 	budget := payloadBudget()
-	attachIDs := attachmentIDsFromRequest(r, req.Messages)
-	attachShape := strings.TrimSpace(r.Header.Get("X-Quickwork-Attachment-Shape"))
-	attachments := buildAttachmentRefs(attachIDs, attachShape)
+	turnAttachments := attachmentsForTurn(r, req.Messages)
 	// The upstream rejects any single user_message frame over 64 KB. Keep the
 	// assembled request inside the budget: compact the tool schemas, then drop
 	// inline attachment payloads, then drop the oldest conversation turns.
@@ -133,18 +131,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sysText = joinSystem(systemPromptText, bridgePrompt)
 		total, _, _ = payloadBytes(prompt, sysText)
 	}
-	// Inline attachments ride inside the frame. If they push it over budget,
-	// shed the heaviest inline payloads first (their id reference remains).
-	if !attachBypassBudget() && total+attachmentBytes(attachments) > budget {
-		attachments = trimInlineAttachments(attachments, budget-total-envelopeSlack)
-	}
-	attachSize := attachmentBytes(attachments)
-	if total+attachSize > budget {
-		prompt, dropped = formatPromptBudget(req.Messages, budget-len(sysText)-attachSize-envelopeSlack)
+	if total > budget {
+		prompt, dropped = formatPromptBudget(req.Messages, budget-len(sysText)-envelopeSlack)
 		total, _, _ = payloadBytes(prompt, sysText)
 	}
-	total += attachSize
-	if total > budget && !attachBypassBudget() {
+	// An oversized block of text is not fatal: the upstream layer spills it into a
+	// workspace file and references that instead. Only reject when nothing is big
+	// enough to spill.
+	canSpill := len(prompt) > spillThreshold || len(sysText) > spillThreshold
+	if total > budget && !canSpill && !attachBypassBudget() {
 		writeOpenAIError(w, http.StatusBadRequest, "request_too_large",
 			payloadTooLargeError(total, budget, prompt, sysText, dropped).Error())
 		return
@@ -173,7 +168,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ThreadID:     threadID,
 		Title:        titleFor(lastUserText(req.Messages)),
 		SystemPrompt: systemPromptText,
-		Attachments:  attachments,
+		Attachments:  turnAttachments,
 	}
 
 	if !req.Stream {

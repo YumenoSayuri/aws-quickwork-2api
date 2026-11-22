@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -36,7 +37,7 @@ type ChatInput struct {
 	ThreadID     string
 	Title        string
 	SystemPrompt string
-	Attachments  []map[string]any
+	Attachments  []RawAttachment
 }
 
 // ToolCallState is a tool invocation reported by the QuickWork agent.
@@ -188,6 +189,18 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"payload": map[string]any{"session_id": threadID, "title": title},
 	})
 
+	// Attachments go out of band: upload, wait for the DLP verdict, bind into
+	// this session, then reference only the returned workspace path. The frame
+	// therefore carries metadata of a few hundred bytes, not the file bytes.
+	var prepared []map[string]any
+	for i, att := range in.Attachments {
+		desc, err := u.prepareAttachment(ctx, sess, threadID, att, i+1)
+		if err != nil {
+			return ChatResult{}, err
+		}
+		prepared = append(prepared, desc)
+	}
+
 	payload := map[string]any{
 		"text":               in.Prompt,
 		"send_origin":        "programmatic",
@@ -215,12 +228,46 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	if strings.TrimSpace(in.SystemPrompt) != "" {
 		payload["system_prompt"] = in.SystemPrompt
 	}
-	if len(in.Attachments) > 0 {
-		attachPayload(payload, in.Attachments)
+	if len(prepared) > 0 {
+		payload["attachments"] = prepared
 	}
 	if u.cfg.ThinkingEffort != "" && u.cfg.ThinkingEffort != "off" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
 	}
+	// Frame budget guard with spill-to-file: when the assembled frame would blow
+	// the single-frame limit, move the long prompt (then the system prompt) into
+	// a workspace file and reference it instead of carrying the text inline.
+	frameBytes := frameSize(payload)
+	if !attachBypassBudget() && frameBytes > maxFrameBudget {
+		if text, _ := payload["text"].(string); len(text) > spillThreshold {
+			if desc, err := u.prepareAttachment(ctx, sess, threadID,
+				RawAttachment{Kind: "file", Name: "conversation_context.txt", MimeType: "text/plain", Data: []byte(text)},
+				len(prepared)+1); err == nil {
+				prepared = append(prepared, desc)
+				payload["attachments"] = prepared
+				payload["text"] = spillNotice(len(text), "conversation_context.txt") + tailUTF8(text, spillTailBytes)
+				frameBytes = frameSize(payload)
+			} else {
+				log.Printf("spill conversation_context failed: %v", err)
+			}
+		}
+	}
+	if !attachBypassBudget() && frameBytes > maxFrameBudget {
+		if sys, _ := payload["system_prompt"].(string); len(sys) > spillThreshold {
+			if desc, err := u.prepareAttachment(ctx, sess, threadID,
+				RawAttachment{Kind: "file", Name: "system_instructions.txt", MimeType: "text/plain", Data: []byte(sys)},
+				len(prepared)+1); err == nil {
+				prepared = append(prepared, desc)
+				payload["attachments"] = prepared
+				payload["system_prompt"] = spillNotice(len(sys), "system_instructions.txt") + tailUTF8(sys, spillTailBytes)
+				frameBytes = frameSize(payload)
+			} else {
+				log.Printf("spill system_instructions failed: %v", err)
+			}
+		}
+	}
+	log.Printf("sending %d attachment(s) on thread %s (frame=%d bytes)", len(prepared), threadID, frameBytes)
+
 	frame := map[string]any{"type": "user_message", "payload": payload}
 	if err := send(frame); err != nil {
 		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
@@ -775,4 +822,41 @@ func titleFor(prompt string) string {
 		clean = "New Conversation"
 	}
 	return clean
+}
+
+// maxFrameBudget keeps the assembled user_message under the upstream limit with
+// margin: base64 wrapping in the AIDP envelope inflates it further.
+const maxFrameBudget = 54 * 1024
+
+// spillThreshold is the shortest text worth moving into a file.
+const spillThreshold = 12 * 1024
+
+// spillTailBytes is how much of a spilled text stays inline as a tail marker.
+const spillTailBytes = 3500
+
+// frameSize reports the serialized size of the user_message JSON.
+func frameSize(payload map[string]any) int {
+	raw, err := json.Marshal(map[string]any{"type": "user_message", "payload": payload})
+	if err != nil {
+		return 0
+	}
+	return len(raw)
+}
+
+// spillNotice is prepended to the shortened text so the model knows where the
+// full content went.
+func spillNotice(total int, name string) string {
+	return fmt.Sprintf("[context spilled to attachment %q (%d characters). Read that file in full before answering.]\n\n", name, total)
+}
+
+// tailUTF8 returns the last maxBytes of s on a rune boundary.
+func tailUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	start := len(s) - maxBytes
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }

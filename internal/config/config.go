@@ -49,6 +49,14 @@ type OAuth struct {
 	Timeout      Duration `json:"timeout"`
 }
 
+// WUI holds the browser management console settings.
+type WUI struct {
+	Enabled  bool     `json:"enabled"`
+	Addr     string   `json:"addr"`
+	Password string   `json:"password"`
+	Session  Duration `json:"session_ttl"`
+}
+
 // Config is the server configuration stored in config.json.
 type Config struct {
 	Addr             string   `json:"addr"`
@@ -68,6 +76,7 @@ type Config struct {
 	ThinkingEffort   string   `json:"thinking_effort"`
 	KeepSessions     bool     `json:"keep_sessions"`
 	OAuth            OAuth    `json:"oauth"`
+	WUI              WUI      `json:"wui"`
 
 	// Path is the absolute config file path; not serialized.
 	Path string `json:"-"`
@@ -93,6 +102,11 @@ func Default() Config {
 			BuildStage:   "prod",
 			CallbackPort: 18080,
 			Timeout:      Duration(time.Hour),
+		},
+		WUI: WUI{
+			Enabled: false,
+			Addr:    "127.0.0.1:9080",
+			Session: Duration(12 * time.Hour),
 		},
 	}
 }
@@ -192,6 +206,12 @@ func applyDefaults(c *Config) {
 	if c.OAuth.Timeout <= 0 {
 		c.OAuth.Timeout = d.OAuth.Timeout
 	}
+	if strings.TrimSpace(c.WUI.Addr) == "" {
+		c.WUI.Addr = d.WUI.Addr
+	}
+	if c.WUI.Session <= 0 {
+		c.WUI.Session = d.WUI.Session
+	}
 }
 
 func (c *Config) validate() error {
@@ -210,6 +230,9 @@ func (c *Config) validate() error {
 	case "prod", "beta", "integ", "dev":
 	default:
 		return fmt.Errorf("oauth.build_stage must be prod, beta, integ or dev")
+	}
+	if c.WUI.Enabled && strings.TrimSpace(c.WUI.Password) == "" {
+		return fmt.Errorf("wui.password must be set when wui.enabled is true")
 	}
 	return nil
 }

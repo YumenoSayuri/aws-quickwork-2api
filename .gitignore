@@ -12,3 +12,11 @@ dist/
 # Local artifacts
 page-signup.png
 *.log
+
+# Local build toolchain, scratch files and deployment notes (never published)
+_probe/
+deploy/
+docs/
+node_modules/
+package.json
+package-lock.json

@@ -40,6 +40,8 @@ func run(args []string) int {
 		return refreshAccounts(args[1:])
 	case "logout":
 		return logout(args[1:])
+	case "webui", "console":
+		return webui(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return 0
@@ -62,6 +64,7 @@ Usage:
                       [-stage prod|beta|integ|dev] [-region REGION] [-port 18080]
                       [-timeout 1h] [-open] [-manual]
   quickproxy accounts [-config config.json]
+  quickproxy webui    [-config config.json]
   quickproxy refresh  [-config config.json] [-account ID]
   quickproxy logout   [-config config.json] (-all | -account ID)
 
@@ -120,6 +123,16 @@ func serve(args []string) int {
 
 	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if cfg.WUI.Enabled {
+		console, err := startConsole(cfg, st, *configPath)
+		if err != nil {
+			log.Printf("console disabled: %v", err)
+		} else {
+			go console.run(stop)
+		}
+	}
+
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

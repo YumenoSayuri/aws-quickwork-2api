@@ -4,6 +4,8 @@
 
 项目是单一 Go 可执行文件：原生 OAuth 登录、账号存储、token 刷新和反代全部由 Go 完成，不需要 Python，也不用启动官方桌面应用或 outpost 进程。登录后由反代把 `/v1/chat/completions` 请求转换为 QuickWork WebSocket 帧，并把结果转回普通 JSON 或 SSE。
 
+> **本仓库是 [jasonxu114514/aws-quickwork-2api](https://github.com/jasonxu114514/aws-quickwork-2api) 的 fork**，在原项目基础上增加了网页管理控制台（见「网页控制台」一节）。反代核心、OAuth 流程、账号存储等全部来自原作者，感谢 [@jasonxu114514](https://github.com/jasonxu114514) 的开源工作。
+>
 > 非官方项目，与 Amazon / AWS 无关联。请仅在你拥有或获得明确授权的账号上使用，并遵守相关服务条款。
 
 ## 功能
@@ -151,6 +153,12 @@ for chunk in client.chat.completions.create(
     "region": "",
     "callback_port": 18080,
     "timeout": "1h"
+  },
+  "wui": {
+    "enabled": false,
+    "addr": "127.0.0.1:9080",
+    "password": "",
+    "session_ttl": "12h"
   }
 }
 ```
@@ -176,6 +184,10 @@ for chunk in client.chat.completions.create(
 | `oauth.region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
 | `oauth.callback_port` | `18080` | 本机 OAuth 回调端口 |
 | `oauth.timeout` | `1h` | 等待浏览器完成登录的超时 |
+| `wui.enabled` | `false` | 随 `serve` 一起启动网页管理控制台 |
+| `wui.addr` | `127.0.0.1:9080` | 控制台监听地址；需要公网访问时改成 `0.0.0.0:端口` |
+| `wui.password` | 空 | 控制台登录密码；`enabled` 为 `true` 时必填，否则拒绝启动 |
+| `wui.session_ttl` | `12h` | 控制台登录态有效期 |
 
 时间字段接受 Go duration 字符串（`30s`、`5m`、`1h`）。
 
@@ -194,6 +206,7 @@ for chunk in client.chat.completions.create(
 | 命令 | 说明 |
 |---|---|
 | `quickproxy serve` | 启动反代 |
+| `quickproxy webui` | 只启动网页管理控制台（不启反代） |
 | `quickproxy login` | 浏览器 OAuth 登录并写入 SQLite |
 | `quickproxy accounts` | 列出账号、到期时间、使用次数与最近错误 |
 | `quickproxy refresh` | 刷新全部账号的 token |
@@ -216,6 +229,52 @@ for chunk in client.chat.completions.create(
 | `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
 | `-open` | 关闭 | 同时用默认浏览器打开 URL |
 | `-manual` | 关闭 | 不监听本地回调端口，手动粘贴浏览器地址栏中的 callback URL（适合服务器） |
+
+## 网页控制台
+
+服务器上不方便开终端时，用内建控制台加号、管号池。
+
+```json
+{
+  "wui": {
+    "enabled": true,
+    "addr": "0.0.0.0:9080",
+    "password": "换成一个强密码",
+    "session_ttl": "12h"
+  }
+}
+```
+
+`wui.enabled` 为 `true` 时，`quickproxy serve` 会额外监听一个 HTTP 端口；也可以用 `quickproxy webui` 单独启动，不占反代进程。
+
+打开 `http://<地址>:9080/` 输入密码后可以：
+
+- **添加账号**：点「+ 添加账号」，面板会从句柄启动一次 `login -manual`，并把 discovery URL 回显出来。整个流程是**两步**，面板会分步引导：
+  1. 打开 discovery URL，用邮箱注册 AWS Builder ID 或直接登录。完成后浏览器跳向 `http://127.0.0.1:18080/callback?nonce=...`，页面报「无法访问此网站」不用管，复制地址栏整串贴回「回调 URL」提交。
+  2. 面板拿到上游返回的**授权地址**（`https://oidc.<region>.amazonaws.com/authorize?...`）后会在「第 2 步」单独显示，点「继续登录」打开它；授权完成后再把地址栏里的 `...?code=...&state=...` 贴回同一个输入框提交，账号即写入号池。
+
+  输入框是通用的：面板按 URL 参数自动识别阶段（`nonce=` → discovery 回调，`code=` → 授权回调，`/authorize?` → 授权地址，会提示你去浏览器打开）。授权回调若手快提前贴了，会先存住，等第一步完成自动补交。CLI 输出的每一步实时回显在面板日志里，出错原因（如 `discovery failed: ...`）直接顶到提示行。
+- **号池管理**：查看每个账号的邮箱、状态（可用 / 即将到期 / 已过期 / 已停用 / 异常）、到期时间、使用次数、最近使用时间与最近错误；单账号刷新、停用 / 启用、删除，以及一键刷新全部 Token。
+- **服务配置**：查看监听地址、数据库路径、上游 Provider、API Key 数量，并修改 `default_model`、`timezone`、`locale`、`thinking_effort`。写回 `config.json` 需要重启服务生效。
+
+控制台的安全边界：密码用 SHA-256 定长比较，登录态是 32 字节随机会话 Cookie（`HttpOnly` + `SameSite=Lax`），密码校验失败固定延迟 250ms。**控制台暴露到公网时务必配强密码**，它等价于号池的完全控制权；更稳妥的做法是只监听回环地址，通过 SSH 端口转发或 Cloudflare Tunnel 访问。
+
+管理接口一览（均需会话 Cookie）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/session` | 查询当前会话状态 |
+| `POST` | `/api/session` | 密码换会话 Cookie |
+| `GET` | `/api/state` | 号池 + 配置 + 当前登录状态 |
+| `POST` | `/api/login` | 启动一次登录，返回 discovery URL |
+| `GET` | `/api/login/current` | 轮询登录进度与日志 |
+| `POST` | `/api/login/callback` | 提交粘贴的回调 URL |
+| `POST` | `/api/login/cancel` | 取消进行中的登录 |
+| `POST` | `/api/refresh` | 刷新全部账号 token |
+| `POST` | `/api/accounts/{id}/refresh` | 刷新单个账号 |
+| `POST` | `/api/accounts/{id}/disable` \| `enable` | 停用 / 启用 |
+| `DELETE` | `/api/accounts/{id}` | 删除账号 |
+| `GET` \| `POST` | `/api/config` | 读取 / 写回运行参数 |
 
 ## 多账号轮询
 
@@ -310,12 +369,13 @@ sequenceDiagram
 ```
 quickwork-openai/
   config.json              服务端配置（首次运行自动生成）
-  cmd/quickproxy/          CLI：serve / login / accounts / refresh / logout
+  cmd/quickproxy/          CLI：serve / login / accounts / refresh / logout / webui
   internal/config/         config.json 加载与默认值
   internal/oauth/          原生 OAuth、PKCE、token refresh、user info
   internal/store/          SQLite 账号存储
   internal/accounts/       多账号轮询与自动刷新
   internal/proxy/          WebSocket codec、OpenAI handler
+  internal/wui/            网页管理控制台（内嵌 HTML，无外部依赖）
   data/quickwork.db        运行期账号库（gitignored）
 ```
 

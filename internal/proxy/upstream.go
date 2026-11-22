@@ -227,6 +227,14 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	// notice, so instructions the service attaches to the turn lose precedence.
 	if strings.TrimSpace(in.SystemPrompt) != "" {
 		payload["system_prompt"] = in.SystemPrompt
+		// The desktop surface has no per-turn system_prompt field: its payload
+		// builder only carries custom_prompt. Keep both so the text lands on
+		// whichever surface the account uses.
+		if cur, ok := payload["custom_prompt"].(string); ok && strings.TrimSpace(cur) != "" {
+			payload["custom_prompt"] = in.SystemPrompt + "\n\n" + cur
+		} else {
+			payload["custom_prompt"] = in.SystemPrompt
+		}
 	}
 	if len(prepared) > 0 {
 		payload["attachments"] = prepared
@@ -259,11 +267,25 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 				len(prepared)+1); err == nil {
 				prepared = append(prepared, desc)
 				payload["attachments"] = prepared
-				payload["system_prompt"] = spillNotice(len(sys), "system_instructions.txt") + tailUTF8(sys, spillTailBytes)
+				shortened := spillNotice(len(sys), "system_instructions.txt") + tailUTF8(sys, spillTailBytes)
+				payload["system_prompt"] = shortened
+				// custom_prompt carries the same text on the desktop surface; it has to
+				// shrink too, otherwise the frame stays over budget.
+				payload["custom_prompt"] = shortened
 				frameBytes = frameSize(payload)
 			} else {
 				log.Printf("spill system_instructions failed: %v", err)
 			}
+		}
+	}
+	if !attachBypassBudget() && frameBytes > maxFrameBudget {
+		return ChatResult{}, &PayloadTooLargeError{
+			Frame:    frameBytes,
+			Budget:   maxFrameBudget,
+			Text:     len(in.Prompt),
+			System:   len(in.SystemPrompt),
+			Tools:    len(fmt.Sprint(payload["pre_tools"], payload["tools"])),
+			CanSpill: false,
 		}
 	}
 	log.Printf("sending %d attachment(s) on thread %s (frame=%d bytes)", len(prepared), threadID, frameBytes)
@@ -748,7 +770,11 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
-			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
+			msg := errorText(env.Payload, env.Error, env.ErrorCode)
+			if IsContentFilterMessage(msg) {
+				return res, &ContentFilterError{Message: msg}
+			}
+			return res, fmt.Errorf("upstream %s: %s", env.Type, msg)
 		default:
 			if terminal[env.Type] {
 				return finish()
@@ -859,4 +885,49 @@ func tailUTF8(s string, maxBytes int) string {
 		start++
 	}
 	return s[start:]
+}
+
+// ContentFilterError reports that the upstream stopped the reply because of its
+// own content policy. It is not an account fault: the same account can succeed
+// on the next attempt because the block happens mid-generation.
+type ContentFilterError struct {
+	Message string
+}
+
+func (e *ContentFilterError) Error() string {
+	if strings.TrimSpace(e.Message) == "" {
+		return "upstream content filter stopped this reply"
+	}
+	return e.Message
+}
+
+// IsContentFilterMessage recognizes the upstream phrasing for a filtered reply.
+func IsContentFilterMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, needle := range []string{"content filter", "content_filter", "content policy", "filter stopped", "safety filter", "blocked this reply"} {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// PayloadTooLargeError reports a frame that cannot be squeezed under the
+// upstream single-frame limit even after spilling text into files.
+type PayloadTooLargeError struct {
+	Frame    int
+	Budget   int
+	Text     int
+	System   int
+	Tools    int
+	CanSpill bool
+}
+
+func (e *PayloadTooLargeError) Error() string {
+	hint := "reduce the conversation history"
+	if e.Tools > 2048 {
+		hint = "reduce the number of tools or their schema size"
+	}
+	return fmt.Sprintf("request payload is %d bytes, over the upstream limit of %d bytes (text %d + system_prompt %d); %s",
+		e.Frame, e.Budget, e.Text, e.System, hint)
 }

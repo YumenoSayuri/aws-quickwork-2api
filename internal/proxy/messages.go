@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -356,7 +357,14 @@ func systemPrompt(msgs []Message) string {
 			parts = append(parts, text)
 		}
 	}
-	parts = append(parts, upstreamPromptOverride)
+	// The override notice is off by default. Measured behaviour: it does not
+	// change the assistant's identity (the service's own prompt wins), and the
+	// model reads it as a prompt-injection attempt and says so. Tool bridging
+	// works without it, so it only adds noise. Opt in with
+	// QUICKWORK_FORCE_OVERRIDE=1 if a future surface needs it.
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("QUICKWORK_FORCE_OVERRIDE")), "1") {
+		parts = append(parts, upstreamPromptOverride)
+	}
 	return strings.Join(parts, "\n\n")
 }
 

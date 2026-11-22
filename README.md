@@ -421,3 +421,36 @@ quickwork-openai/
 ## Acknowledgements
 
 Thanks to the [LINUX DO](https://linux.do) community for its support.
+
+## 版本历史
+
+> 本仓库从上游 v0.4.1 分叉，以下只记录本 fork 相对上游的变更，倒序排列；时间取提交时的真实时间（UTC+08:00）。
+
+### v0.6.0 — 2026-11-22 17:30:08
+
+适配上游 64 KB 帧限制，新增附件上传接口。
+
+- 新增 `POST /v1/files`：把文件上传到账号数据平面，返回 `file-<attachmentId>`，单文件上限 20 MB
+  - 上游是 Coral RPC 风格，参数走 query、请求体为文件原始字节：`POST {tenantUrl}/integration/quick-work/upload-attachment?name=&contentLength=&contentType=`
+  - `Session` 增加 `TenantURL`，用于定位该账号的数据平面
+- 新增发送前载荷预算控制：上游对单个 `user_message` 帧有 64 KB 上限（`FrameTooLarge`），超限会整轮失败
+  - 先精简工具协议 schema：紧凑 JSON，剥掉 `description`、`$schema`、`examples`、`default`、`additionalProperties` 等纯占字节的注解，保留参数名、类型、`required` 与 `enum`
+  - 仍超限则从最老轮次裁剪历史，绝不动当前轮，末尾追加省略提示
+  - 再超限返回 400 `request_too_large`，并说明 `text` 与 `system_prompt` 各占多少字节
+  - 预算默认 62000 字节，可用环境变量 `QUICKPROXY_MAX_PAYLOAD` 覆盖
+- 实测：242 KB 历史请求与 266 KB 工具集请求，改动前均 502 失败，改动后均正常返回
+- 已知限制：附件上传链路可用，但把 `attachmentId` 关联进对话帧的字段格式尚未确认，上传的文件暂不会进入模型上下文
+
+### v0.5.0 — 2026-11-22 15:38:30
+
+新增网页管理控制台。
+
+- `config.json` 增加 `wui` 配置块（`enabled` / `addr` / `password` / `session_ttl`）
+  - `serve` 时附带启动控制台；也可用 `quickproxy webui` 单独运行，不启反代
+  - `enabled` 为真但 `password` 为空时拒绝启动，避免裸奔
+- 控制台功能：账号池（状态 / 到期 / 用量、单号刷新、停用启用、删除、一键刷新全部）、OAuth 登录、配置面板
+- OAuth 登录支持两阶段手动流程：驱动 `login -manual` 子进程，按 URL 参数自动识别回调类别（`nonce=` 为 discovery 回调、`code=` 为授权回调、`/authorize?` 为授权地址），提前到达的授权回调先暂存、待 discovery 完成后自动补交；CLI 输出实时回显
+- 配置面板可编辑 `default_model`、`timezone`、`locale`、`thinking_effort`，写回 `config.json` 采用临时文件 + rename 原子替换
+- 鉴权：SHA-256 定长比较 + 内存会话 Cookie（`HttpOnly`、`SameSite=Lax`），密码校验失败固定延迟
+- 新增 `internal/wui` 包，HTML 内嵌，未引入任何第三方依赖
+

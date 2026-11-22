@@ -37,7 +37,11 @@ type ChatInput struct {
 	ThreadID     string
 	Title        string
 	SystemPrompt string
-	Attachments  []RawAttachment
+	ChatAgentID  string
+	// OperatingInstructions is the tenant prompt carried in-context (carrier
+	// mode), used when a shared agent must serve many different personas.
+	OperatingInstructions string
+	Attachments           []RawAttachment
 }
 
 // ToolCallState is a tool invocation reported by the QuickWork agent.
@@ -201,8 +205,16 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		prepared = append(prepared, desc)
 	}
 
+	promptText := in.Prompt
+	if strings.TrimSpace(in.OperatingInstructions) != "" {
+		// Carrier mode: the operator's instructions ride as context instead of a
+		// system field the desktop surface does not have. Everything a tenant
+		// needs (persona, language, style) lives here, so one shared agent can
+		// serve many tenants.
+		promptText = "<operating_instructions>\n" + in.OperatingInstructions + "\n</operating_instructions>\n\n" + promptText
+	}
 	payload := map[string]any{
-		"text":               in.Prompt,
+		"text":               promptText,
 		"send_origin":        "programmatic",
 		"had_physical_input": false,
 		"surfaceType":        sess.Surface,
@@ -214,7 +226,8 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"agent_mode":         in.Model,
 		"user_timezone":      u.cfg.Timezone,
 		"user_locale":        u.cfg.Locale,
-		"chat_agent_id":      nil,
+		"chat_agent_id":      agentIDValue(in.ChatAgentID),
+		"use_draft":          strings.TrimSpace(in.ChatAgentID) != "",
 		"auto_routing":       false,
 		"web_search_enabled": false,
 		"pre_approved_tools": []any{},
@@ -930,4 +943,13 @@ func (e *PayloadTooLargeError) Error() string {
 	}
 	return fmt.Sprintf("request payload is %d bytes, over the upstream limit of %d bytes (text %d + system_prompt %d); %s",
 		e.Frame, e.Budget, e.Text, e.System, hint)
+}
+
+// agentIDValue maps an empty agent id to a JSON null, which is what the service
+// expects when the default agent should answer.
+func agentIDValue(id string) any {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	return strings.TrimSpace(id)
 }

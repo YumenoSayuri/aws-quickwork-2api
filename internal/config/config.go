@@ -68,6 +68,8 @@ type Config struct {
 	RefreshBefore    Duration `json:"refresh_before"`
 	MaxAttempts      int      `json:"max_attempts"`
 	AppVersion       string   `json:"app_version"`
+	AgentID          string   `json:"agent_id"`
+	AgentMode        string   `json:"agent_mode"`
 	Surface          string   `json:"surface"`
 	OutpostID        string   `json:"outpost_id"`
 	WorkingSessionID string   `json:"working_session_id"`

@@ -278,6 +278,57 @@ for chunk in client.chat.completions.create(
 | `DELETE` | `/api/accounts/{id}` | 删除账号 |
 | `GET` \| `POST` | `/api/config` | 读取 / 写回运行参数 |
 
+## 自定义 Agent 与多租户人格
+
+桌面端 `user_message` 帧里**没有** `system_prompt` 字段（这个名字只出现在 agent 定义的导入导出里），所以调用方的 system 消息此前不会进入模型视野。真正承载人格的字段只有两个：
+
+| 层 | 字段 | 作用 | 局限 |
+| --- | --- | --- | --- |
+| Agent 定义层 | `instructions` | 写进自定义 agent，进入 system 层 | 是**叠加**，改不掉服务端基座身份（模型仍会说自己是 AWS Quick） |
+| 轮次上下文层 | `custom_prompt` / 提示正文 | 每轮随请求下发 | 模型视其为「用户设定」，优先级低于 system |
+
+### agent 生命周期走 /api/ws-rpc
+
+agent 管理在桌面端是 WebSocket 命令，但每条命令都能当普通 HTTP 打到运行时的 `/api/ws-rpc`，再由数据平面 `qbs-event` 的 `invokeAgent` 信封转发。响应形如 `{"frames":[{"type":"agent_draft_created","payload":{"agent_id":"..."}}]}`。
+
+```
+POST /v1/agents  {"name":"Carrier","instructions":"..."}   ->  {"agent_id":"..."}
+```
+
+拿到 id 后，对话请求带上 `X-Quickwork-Agent: <id>`（或配置 `agent_id`），代理会同时置 `chat_agent_id` 与 `use_draft`。
+
+注意：**发布（publish）走不通**——`publish_agent_draft` 在服务端跑得比中继超时长，`invokeAgent` 直接返回 `TIMEOUT`，所以只保留草稿形态，靠 `use_draft` 引用。
+
+### 多租户：一个共享 agent + 上下文注入
+
+给每个租户建 agent 会撞 `max_custom_agents` 配额，且每个都要走一遍创建流程。可行做法是**一个中性 carrier agent 服务所有租户**：
+
+```
+agent_mode: "carrier"   # 开启后，调用方 system 文本会作为上下文块注入
+agent_id:   "<carrier 的 id>"
+```
+
+注入形式：
+
+```
+<operating_instructions>
+<调用方的 system/developer 文本>
+</operating_instructions>
+
+<用户消息>
+```
+
+carrier agent 自身的 instructions 保持中性（「按上下文中的 operating instructions 决定人格、语言、风格，不要自己产出固定标记」），差异全部由上下文承载。
+
+实测（同一个 agent 连续服务两个租户）：
+
+| 租户 | system 指令 | 回复 |
+| --- | --- | --- |
+| A | 只用日语，结尾 `[KO]` | 日语回答，结尾 `[KO]` |
+| B | 只用中文，结尾 `[AH]` | 中文回答，结尾 `[AH]` |
+
+语言、语气、格式标记全部正确切换。唯一残留是自述身份那一句仍会带出基座产品名——那是服务端 system 层的内容，`instructions` 覆盖不掉。
+
 ## 附件与超长上下文
 
 图片和文件走官方同一套**外带（out-of-band）**链路：文件字节留在服务端工作区，WebSocket 帧里只带几百字节元数据，因此**不受 64 KB 单帧限制**。
